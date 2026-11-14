@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { useShortcutStore } from "@/stores/shortcut.store";
 import { useCommandStore } from "@/stores/command.store";
 import { useUIStore } from "@/stores/ui.store";
-import { useComposeStore } from "@/stores/compose.store";
+import { isComposeDirty, useComposeStore } from "@/stores/compose.store";
 import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
 import { updateMessageFlags, archiveMessage, deleteMessage, restoreMessage, getMessage } from "@/lib/api";
@@ -14,7 +14,8 @@ import {
   restoreMessagesCache,
   snapshotMessagesCache,
 } from "@/hooks/queries";
-import { roleForSelection } from "@/lib/folderAggregation";
+import { allAccountsFolderId, roleForSelection, type FolderRole } from "@/lib/folderAggregation";
+import { VIM_BINDINGS, VIM_PREFIXES, VIM_SEQUENCE_TIMEOUT_MS } from "@/lib/vimKeys";
 import i18n from "@/lib/i18n";
 
 function eventToKeyString(e: KeyboardEvent): string {
@@ -128,6 +129,255 @@ function deleteSelectedMessage() {
     });
 }
 
+/** Select the first or last message (or thread) in the loaded list */
+function selectMessageAt(position: "first" | "last") {
+  const state = useMailStore.getState();
+  if (state.threadView) {
+    const threads = getCachedThreads();
+    const thread = position === "first" ? threads[0] : threads[threads.length - 1];
+    if (thread) state.setSelectedThreadId(thread.thread_id);
+  } else {
+    const messages = getCachedMessages();
+    const message = position === "first" ? messages[0] : messages[messages.length - 1];
+    if (message) state.setSelectedMessage(message.id);
+  }
+}
+
+function closeSelectedMessage() {
+  const state = useMailStore.getState();
+  if (state.threadView) state.setSelectedThreadId(null);
+  else state.setSelectedMessage(null);
+}
+
+/**
+ * Open the system folder with this role for the active account, or the
+ * combined folder when viewing all accounts. Respects unsaved compose drafts
+ * the same way a sidebar click does.
+ */
+function goToFolderRole(role: FolderRole) {
+  const { activeAccountId } = useMailStore.getState();
+  const folderId = activeAccountId
+    ? getCachedFolders().find((f) => f.account_id === activeAccountId && f.role === role)?.id
+    : allAccountsFolderId(role);
+  if (!folderId) return;
+
+  if (isComposeDirty()) {
+    useComposeStore.setState({
+      showComposeLeaveConfirm: true,
+      pendingView: "inbox",
+      pendingNavigation: () => useMailStore.getState().setActiveFolderId(folderId),
+    });
+    return;
+  }
+  useUIStore.getState().setActiveView("inbox");
+  useMailStore.getState().setActiveFolderId(folderId);
+}
+
+/** Execute a shortcut action. Shared by rebindable shortcuts and vim keys. */
+function runAction(actionId: string) {
+  switch (actionId) {
+    case "close-modal":
+      if (useCommandStore.getState().isOpen) {
+        useCommandStore.getState().close();
+      } else if (useUIStore.getState().activeView === "compose") {
+        useComposeStore.getState().closeCompose();
+      } else if (useUIStore.getState().activeView === "search") {
+        useUIStore.getState().setActiveView("inbox");
+      }
+      break;
+    case "toggle-view-inbox":
+      useUIStore.getState().setActiveView("inbox");
+      break;
+    case "toggle-view-kanban":
+      useUIStore.getState().setActiveView("kanban");
+      break;
+    case "toggle-star": {
+      const { selectedMessageId } = useMailStore.getState();
+      if (selectedMessageId) {
+        const messages = getCachedMessages();
+        const msg = messages.find((m) => m.id === selectedMessageId);
+        if (msg) {
+          const newStarred = !msg.is_starred;
+          // Optimistic update in React Query cache
+          patchMessagesCache(queryClient, (page) =>
+            page.map((m) =>
+              m.id === selectedMessageId ? { ...m, is_starred: newStarred } : m,
+            ),
+          );
+          updateMessageFlags(selectedMessageId, undefined, newStarred)
+            .then(() => queryClient.invalidateQueries({ queryKey: ["messages"] }))
+            .catch(() => {
+              // Rollback on error
+              patchMessagesCache(queryClient, (page) =>
+                page.map((m) =>
+                  m.id === selectedMessageId ? { ...m, is_starred: !newStarred } : m,
+                ),
+              );
+            });
+        }
+      }
+      break;
+    }
+    case "archive-message": {
+      const { selectedMessageId } = useMailStore.getState();
+      if (selectedMessageId) {
+        // Optimistic removal from React Query cache
+        patchMessagesCache(queryClient, (page) =>
+          page.filter((m) => m.id !== selectedMessageId),
+        );
+        useMailStore.getState().setSelectedMessage(null);
+        archiveMessage(selectedMessageId)
+          .then((result) => {
+            if (result === "skipped") return;
+            queryClient.invalidateQueries({ queryKey: ["messages"] });
+            queryClient.invalidateQueries({ queryKey: ["threads"] });
+            queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+            const msg = result === "unarchived" ? i18n.t("messageActions.unarchiveSuccess", "Message moved to inbox") : i18n.t("messageActions.archiveSuccess", "Message archived");
+            useToastStore.getState().addToast({ message: msg, type: "success" });
+          })
+          .catch(() => {
+            queryClient.invalidateQueries({ queryKey: ["messages"] });
+            useMailStore.getState().setSelectedMessage(selectedMessageId);
+            useToastStore.getState().addToast({ message: i18n.t("messageActions.archiveFailed", "Failed to archive"), type: "error" });
+          });
+      }
+      break;
+    }
+    case "delete-message":
+      deleteSelectedMessage();
+      break;
+    case "next-message": {
+      const state = useMailStore.getState();
+      if (state.threadView) {
+        const threads = getCachedThreads();
+        const idx = threads.findIndex((t) => t.thread_id === state.selectedThreadId);
+        if (idx < threads.length - 1) {
+          state.setSelectedThreadId(threads[idx + 1].thread_id);
+        }
+      } else {
+        const messages = getCachedMessages();
+        const idx = messages.findIndex((m) => m.id === state.selectedMessageId);
+        if (idx < messages.length - 1) {
+          state.setSelectedMessage(messages[idx + 1].id);
+        }
+      }
+      break;
+    }
+    case "prev-message": {
+      const state = useMailStore.getState();
+      if (state.threadView) {
+        const threads = getCachedThreads();
+        const idx = threads.findIndex((t) => t.thread_id === state.selectedThreadId);
+        if (idx > 0) {
+          state.setSelectedThreadId(threads[idx - 1].thread_id);
+        }
+      } else {
+        const messages = getCachedMessages();
+        const idx = messages.findIndex((m) => m.id === state.selectedMessageId);
+        if (idx > 0) {
+          state.setSelectedMessage(messages[idx - 1].id);
+        }
+      }
+      break;
+    }
+    case "compose-new":
+      useComposeStore.getState().openCompose("new");
+      break;
+    case "reply": {
+      const { selectedMessageId: selId } = useMailStore.getState();
+      if (selId) {
+        getMessage(selId).then((msg) => {
+          if (msg) useComposeStore.getState().openCompose("reply", msg);
+        });
+      }
+      break;
+    }
+    case "reply-all": {
+      const { selectedMessageId: selId } = useMailStore.getState();
+      if (selId) {
+        getMessage(selId).then((msg) => {
+          if (msg) useComposeStore.getState().openCompose("reply-all", msg);
+        });
+      }
+      break;
+    }
+    case "forward": {
+      const { selectedMessageId: selId } = useMailStore.getState();
+      if (selId) {
+        getMessage(selId).then((msg) => {
+          if (msg) useComposeStore.getState().openCompose("forward", msg);
+        });
+      }
+      break;
+    }
+    case "focus-search":
+      useUIStore.getState().setActiveView("search");
+      break;
+    case "open-message": {
+      const state = useMailStore.getState();
+      if (state.threadView) {
+        if (!state.selectedThreadId) {
+          const threads = getCachedThreads();
+          if (threads.length > 0) {
+            state.setSelectedThreadId(threads[0].thread_id);
+          }
+        }
+      } else {
+        if (!state.selectedMessageId) {
+          const messages = getCachedMessages();
+          if (messages.length > 0) {
+            state.setSelectedMessage(messages[0].id);
+          }
+        }
+      }
+      break;
+    }
+    case "open-search":
+      useUIStore.getState().setActiveView("search");
+      break;
+    case "open-cloud-settings":
+      useUIStore.getState().setActiveView("settings");
+      break;
+    case "toggle-notifications": {
+      const { notificationsEnabled, setNotificationsEnabled } = useUIStore.getState();
+      setNotificationsEnabled(!notificationsEnabled);
+      break;
+    }
+    case "translate-selection":
+      document.dispatchEvent(new CustomEvent("pebble:translate-selection"));
+      break;
+    case "toggle-bilingual":
+      document.dispatchEvent(new CustomEvent("pebble:toggle-bilingual"));
+      break;
+    case "first-message":
+      selectMessageAt("first");
+      break;
+    case "last-message":
+      selectMessageAt("last");
+      break;
+    case "close-message":
+      closeSelectedMessage();
+      break;
+    case "go-inbox":
+      goToFolderRole("inbox");
+      break;
+    case "go-sent":
+      goToFolderRole("sent");
+      break;
+    case "go-drafts":
+      goToFolderRole("drafts");
+      break;
+    case "go-archive":
+      goToFolderRole("archive");
+      break;
+    case "go-trash":
+      goToFolderRole("trash");
+      break;
+    default:
+      break;
+  }
+}
+
 export function useKeyboard() {
   // Reverse lookup: keyString (lowercase) -> actionId, rebuilt only when bindings change
   const keyToActionRef = useRef<Map<string, string>>(new Map());
@@ -153,213 +403,82 @@ export function useKeyboard() {
   }, []);
 
   useEffect(() => {
+    // First key of a pending vim sequence ("d", "g"), cleared after a timeout
+    let pendingKey: string | null = null;
+    let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearPending = () => {
+      pendingKey = null;
+      if (pendingTimer !== undefined) clearTimeout(pendingTimer);
+      pendingTimer = undefined;
+    };
+
     function handleKeyDown(e: KeyboardEvent) {
       if (document.querySelector('[role="dialog"]')) return;
       // Don't interfere with shortcut recording
       if (useShortcutStore.getState().recording) return;
+      // A bare modifier press (e.g. Shift before G) must not break a sequence
+      if (["Control", "Meta", "Shift", "Alt"].includes(e.key)) return;
 
       const target = e.target as HTMLElement;
       const isInput =
         target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
-      const keyString = eventToKeyString(e);
-
-      const actionId = keyToActionRef.current.get(keyString.toLowerCase());
-
-      if (!actionId) return;
+      const keyString = eventToKeyString(e).toLowerCase();
+      const actionId = keyToActionRef.current.get(keyString);
 
       // Command palette always works even in inputs
       if (actionId === "command-palette") {
+        clearPending();
         e.preventDefault();
         useCommandStore.getState().open();
         return;
       }
 
       // Skip single-key shortcuts when in inputs
-      if (isInput) return;
-
-      e.preventDefault();
-
-      // Execute action
-      switch (actionId) {
-        case "close-modal":
-          if (useCommandStore.getState().isOpen) {
-            useCommandStore.getState().close();
-          } else if (useUIStore.getState().activeView === "compose") {
-            useComposeStore.getState().closeCompose();
-          } else if (useUIStore.getState().activeView === "search") {
-            useUIStore.getState().setActiveView("inbox");
-          }
-          break;
-        case "toggle-view-inbox":
-          useUIStore.getState().setActiveView("inbox");
-          break;
-        case "toggle-view-kanban":
-          useUIStore.getState().setActiveView("kanban");
-          break;
-        case "toggle-star": {
-          const { selectedMessageId } = useMailStore.getState();
-          if (selectedMessageId) {
-            const messages = getCachedMessages();
-            const msg = messages.find((m) => m.id === selectedMessageId);
-            if (msg) {
-              const newStarred = !msg.is_starred;
-              // Optimistic update in React Query cache
-              patchMessagesCache(queryClient, (page) =>
-                page.map((m) =>
-                  m.id === selectedMessageId ? { ...m, is_starred: newStarred } : m,
-                ),
-              );
-              updateMessageFlags(selectedMessageId, undefined, newStarred)
-                .then(() => queryClient.invalidateQueries({ queryKey: ["messages"] }))
-                .catch(() => {
-                  // Rollback on error
-                  patchMessagesCache(queryClient, (page) =>
-                    page.map((m) =>
-                      m.id === selectedMessageId ? { ...m, is_starred: !newStarred } : m,
-                    ),
-                  );
-                });
-            }
-          }
-          break;
-        }
-        case "archive-message": {
-          const { selectedMessageId } = useMailStore.getState();
-          if (selectedMessageId) {
-            // Optimistic removal from React Query cache
-            patchMessagesCache(queryClient, (page) =>
-              page.filter((m) => m.id !== selectedMessageId),
-            );
-            useMailStore.getState().setSelectedMessage(null);
-            archiveMessage(selectedMessageId)
-              .then((result) => {
-                if (result === "skipped") return;
-                queryClient.invalidateQueries({ queryKey: ["messages"] });
-                queryClient.invalidateQueries({ queryKey: ["threads"] });
-                queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
-                const msg = result === "unarchived" ? i18n.t("messageActions.unarchiveSuccess", "Message moved to inbox") : i18n.t("messageActions.archiveSuccess", "Message archived");
-                useToastStore.getState().addToast({ message: msg, type: "success" });
-              })
-              .catch(() => {
-                queryClient.invalidateQueries({ queryKey: ["messages"] });
-                useMailStore.getState().setSelectedMessage(selectedMessageId);
-                useToastStore.getState().addToast({ message: i18n.t("messageActions.archiveFailed", "Failed to archive"), type: "error" });
-              });
-          }
-          break;
-        }
-        case "delete-message":
-          deleteSelectedMessage();
-          break;
-        case "next-message": {
-          const state = useMailStore.getState();
-          if (state.threadView) {
-            const threads = getCachedThreads();
-            const idx = threads.findIndex((t) => t.thread_id === state.selectedThreadId);
-            if (idx < threads.length - 1) {
-              state.setSelectedThreadId(threads[idx + 1].thread_id);
-            }
-          } else {
-            const messages = getCachedMessages();
-            const idx = messages.findIndex((m) => m.id === state.selectedMessageId);
-            if (idx < messages.length - 1) {
-              state.setSelectedMessage(messages[idx + 1].id);
-            }
-          }
-          break;
-        }
-        case "prev-message": {
-          const state = useMailStore.getState();
-          if (state.threadView) {
-            const threads = getCachedThreads();
-            const idx = threads.findIndex((t) => t.thread_id === state.selectedThreadId);
-            if (idx > 0) {
-              state.setSelectedThreadId(threads[idx - 1].thread_id);
-            }
-          } else {
-            const messages = getCachedMessages();
-            const idx = messages.findIndex((m) => m.id === state.selectedMessageId);
-            if (idx > 0) {
-              state.setSelectedMessage(messages[idx - 1].id);
-            }
-          }
-          break;
-        }
-        case "compose-new":
-          useComposeStore.getState().openCompose("new");
-          break;
-        case "reply": {
-          const { selectedMessageId: selId } = useMailStore.getState();
-          if (selId) {
-            getMessage(selId).then((msg) => {
-              if (msg) useComposeStore.getState().openCompose("reply", msg);
-            });
-          }
-          break;
-        }
-        case "reply-all": {
-          const { selectedMessageId: selId } = useMailStore.getState();
-          if (selId) {
-            getMessage(selId).then((msg) => {
-              if (msg) useComposeStore.getState().openCompose("reply-all", msg);
-            });
-          }
-          break;
-        }
-        case "forward": {
-          const { selectedMessageId: selId } = useMailStore.getState();
-          if (selId) {
-            getMessage(selId).then((msg) => {
-              if (msg) useComposeStore.getState().openCompose("forward", msg);
-            });
-          }
-          break;
-        }
-        case "focus-search":
-          useUIStore.getState().setActiveView("search");
-          break;
-        case "open-message": {
-          const state = useMailStore.getState();
-          if (state.threadView) {
-            if (!state.selectedThreadId) {
-              const threads = getCachedThreads();
-              if (threads.length > 0) {
-                state.setSelectedThreadId(threads[0].thread_id);
-              }
-            }
-          } else {
-            if (!state.selectedMessageId) {
-              const messages = getCachedMessages();
-              if (messages.length > 0) {
-                state.setSelectedMessage(messages[0].id);
-              }
-            }
-          }
-          break;
-        }
-        case "open-search":
-          useUIStore.getState().setActiveView("search");
-          break;
-        case "open-cloud-settings":
-          useUIStore.getState().setActiveView("settings");
-          break;
-        case "toggle-notifications": {
-          const { notificationsEnabled, setNotificationsEnabled } = useUIStore.getState();
-          setNotificationsEnabled(!notificationsEnabled);
-          break;
-        }
-        case "translate-selection":
-          document.dispatchEvent(new CustomEvent("pebble:translate-selection"));
-          break;
-        case "toggle-bilingual":
-          document.dispatchEvent(new CustomEvent("pebble:toggle-bilingual"));
-          break;
-        default:
-          break;
+      if (isInput) {
+        clearPending();
+        return;
       }
+
+      if (useShortcutStore.getState().vimMode) {
+        const previousKey = pendingKey;
+        clearPending();
+
+        if (previousKey) {
+          const sequenceAction = VIM_BINDINGS[`${previousKey} ${keyString}`];
+          if (sequenceAction) {
+            e.preventDefault();
+            runAction(sequenceAction);
+            return;
+          }
+          // Not a known sequence: handle this key on its own below
+        }
+
+        // User bindings take priority over vim keys
+        if (!actionId) {
+          if (VIM_PREFIXES.has(keyString)) {
+            e.preventDefault();
+            pendingKey = keyString;
+            pendingTimer = setTimeout(clearPending, VIM_SEQUENCE_TIMEOUT_MS);
+            return;
+          }
+          const vimAction = VIM_BINDINGS[keyString];
+          if (vimAction) {
+            e.preventDefault();
+            runAction(vimAction);
+            return;
+          }
+        }
+      }
+
+      if (!actionId) return;
+      e.preventDefault();
+      runAction(actionId);
     }
 
     document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      clearPending();
+      document.removeEventListener("keydown", handleKeyDown);
+    };
   }, []);
 }

@@ -179,4 +179,132 @@ describe("useKeyboard", () => {
       expect(mocks.deleteMessage).not.toHaveBeenCalled();
     });
   });
+
+  describe("vim keys", () => {
+    const folders = [
+      { id: "inbox-1", account_id: "acc-1", role: "inbox" },
+      { id: "sent-1", account_id: "acc-1", role: "sent" },
+      { id: "trash-1", account_id: "acc-1", role: "trash" },
+      { id: "inbox-2", account_id: "acc-2", role: "inbox" },
+    ];
+
+    function press(key: string, init: KeyboardEventInit = {}) {
+      act(() => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...init }));
+      });
+    }
+
+    beforeEach(() => {
+      mocks.deleteMessage.mockResolvedValue(undefined);
+      mocks.queryClient.getQueriesData.mockImplementation(
+        ({ queryKey }: { queryKey: string[] }) =>
+          queryKey[0] === "folders" ? [[["folders", "acc-1"], folders]] : [],
+      );
+      mocks.readFirstCachedMessages.mockReturnValue([
+        { id: "message-0", remote_id: "r0", is_draft: false },
+        { id: "message-1", remote_id: "r1", is_draft: false },
+        { id: "message-2", remote_id: "r2", is_draft: false },
+      ]);
+      useShortcutStore.setState({ vimMode: true });
+      useMailStore.setState({ activeAccountId: "acc-1", activeFolderId: "inbox-1" });
+    });
+
+    it("dd moves the selected message to trash", async () => {
+      renderHook(() => useKeyboard());
+      press("d");
+      expect(mocks.deleteMessage).not.toHaveBeenCalled();
+      press("d");
+      await waitFor(() => expect(mocks.deleteMessage).toHaveBeenCalledWith("message-1"));
+    });
+
+    it("forgets a pending d after the timeout", () => {
+      vi.useFakeTimers();
+      try {
+        renderHook(() => useKeyboard());
+        press("d");
+        act(() => vi.advanceTimersByTime(1100));
+        press("d");
+        expect(mocks.deleteMessage).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("handles a non-matching second key on its own", () => {
+      renderHook(() => useKeyboard());
+      press("d");
+      press("j");
+      expect(useMailStore.getState().selectedMessageId).toBe("message-2");
+      expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    });
+
+    it("gg selects the first message and G the last", () => {
+      renderHook(() => useKeyboard());
+      press("g");
+      press("g");
+      expect(useMailStore.getState().selectedMessageId).toBe("message-0");
+      press("Shift", { shiftKey: true });
+      press("G", { shiftKey: true });
+      expect(useMailStore.getState().selectedMessageId).toBe("message-2");
+    });
+
+    it("h closes the open message and l opens the first one", () => {
+      renderHook(() => useKeyboard());
+      press("h");
+      expect(useMailStore.getState().selectedMessageId).toBeNull();
+      press("l");
+      expect(useMailStore.getState().selectedMessageId).toBe("message-0");
+    });
+
+    it("g-prefixed keys go to the active account's folders", () => {
+      renderHook(() => useKeyboard());
+      press("g");
+      press("s");
+      expect(useMailStore.getState().activeFolderId).toBe("sent-1");
+      press("g");
+      press("t");
+      expect(useMailStore.getState().activeFolderId).toBe("trash-1");
+      press("g");
+      press("i");
+      expect(useMailStore.getState().activeFolderId).toBe("inbox-1");
+    });
+
+    it("goes to the combined folder when viewing all accounts", () => {
+      useMailStore.setState({ activeAccountId: null });
+      renderHook(() => useKeyboard());
+      press("g");
+      press("s");
+      expect(useMailStore.getState().activeFolderId).toBe("all:sent");
+    });
+
+    it("does nothing when vim keys are turned off", () => {
+      useShortcutStore.setState({ vimMode: false });
+      renderHook(() => useKeyboard());
+      press("d");
+      press("d");
+      press("h");
+      expect(mocks.deleteMessage).not.toHaveBeenCalled();
+      expect(useMailStore.getState().selectedMessageId).toBe("message-1");
+    });
+
+    it("lets the user's own bindings win over vim keys", async () => {
+      useShortcutStore.setState({ bindings: { ...DEFAULT_BINDINGS, "archive-message": "D" } });
+      renderHook(() => useKeyboard());
+      press("d");
+      await waitFor(() => expect(mocks.archiveMessage).toHaveBeenCalledWith("message-1"));
+      expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    });
+
+    it("ignores vim keys while typing", () => {
+      renderHook(() => useKeyboard());
+      const input = document.createElement("input");
+      document.body.appendChild(input);
+      act(() => {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+      });
+      input.remove();
+      expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    });
+  });
 });

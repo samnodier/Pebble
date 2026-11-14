@@ -3,6 +3,7 @@ import { Keyboard, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useShortcutStore } from "@/stores/shortcut.store";
 import { eventToKeyString } from "@/hooks/useKeyboard";
+import { VIM_HELP } from "@/lib/vimKeys";
 
 const ACTION_I18N_MAP: Record<string, string> = {
   "command-palette": "shortcuts.openCommandPalette",
@@ -175,6 +176,80 @@ function ShortcutRow({ actionId }: { actionId: string }) {
   );
 }
 
+function VimKeysSection() {
+  const { t } = useTranslation();
+  const vimMode = useShortcutStore((s) => s.vimMode);
+  const setVimMode = useShortcutStore((s) => s.setVimMode);
+
+  return (
+    <div style={{ marginBottom: "24px" }}>
+      <h4
+        style={{
+          fontSize: "12px",
+          fontWeight: 600,
+          textTransform: "uppercase",
+          letterSpacing: "0.05em",
+          color: "var(--color-text-secondary)",
+          marginBottom: "10px",
+        }}
+      >
+        {t("shortcuts.vim.title", "Vim keys")}
+      </h4>
+      <div style={{ borderRadius: "8px", border: "1px solid var(--color-border)", overflow: "hidden" }}>
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "12px",
+            padding: "10px 16px",
+            backgroundColor: "var(--color-bg)",
+            cursor: "pointer",
+          }}
+        >
+          <span style={{ fontSize: "13px", color: "var(--color-text-primary)" }}>
+            {t("shortcuts.vim.enable", "Enable vim keys")}
+            <span style={{ display: "block", fontSize: "11px", color: "var(--color-text-secondary)", marginTop: "2px" }}>
+              {t("shortcuts.vim.description", "Press sequences like d d or g i within one second. Your own shortcuts above take priority.")}
+            </span>
+          </span>
+          <input type="checkbox" checked={vimMode} onChange={(e) => setVimMode(e.target.checked)} />
+        </label>
+        {vimMode && VIM_HELP.map((row) => (
+          <div
+            key={row.keys}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "8px 16px",
+              borderTop: "1px solid var(--color-border)",
+              backgroundColor: "var(--color-bg)",
+            }}
+          >
+            <span style={{ fontSize: "13px", color: "var(--color-text-primary)" }}>{t(row.labelKey, row.fallback)}</span>
+            <kbd
+              style={{
+                padding: "3px 8px",
+                borderRadius: "4px",
+                border: "1px solid var(--color-border)",
+                backgroundColor: "var(--color-bg-secondary)",
+                fontSize: "12px",
+                fontFamily: "monospace",
+                color: "var(--color-text-secondary)",
+                minWidth: "60px",
+                textAlign: "center",
+              }}
+            >
+              {row.keys}
+            </kbd>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function ShortcutsTab() {
   const { t } = useTranslation();
   const resetToDefaults = useShortcutStore((s) => s.resetToDefaults);
@@ -238,6 +313,8 @@ export default function ShortcutsTab() {
           </div>
         )}
       </div>
+
+      <VimKeysSection />
 
       {SHORTCUT_GROUPS.map((group) => (
         <div key={group.categoryKey} style={{ marginBottom: "24px" }}>
