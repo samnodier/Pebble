@@ -31,6 +31,7 @@ import {
   sortFoldersForSidebar,
   unreadCountForFolder,
 } from "../lib/folderAggregation";
+import { ancestorKeys, buildFolderTree, totalForNode, type FolderTreeNode } from "../lib/folderTree";
 import { profileLocalStorage } from "../lib/profileStorage";
 import type { Account, Folder as FolderType } from "../lib/api";
 
@@ -49,6 +50,21 @@ const ROLE_ICONS: Record<AccountGroupRole, React.ReactNode> = {
 };
 
 const COLLAPSED_ACCOUNTS_KEY = "pebble-sidebar-collapsed-accounts";
+const EXPANDED_FOLDERS_KEY = "pebble-sidebar-expanded-folders";
+const TREE_INDENT_PX = 14;
+const TREE_BASE_PADDING_PX = 26;
+
+function readExpandedFolderKeys(): Set<string> {
+  try {
+    const stored = profileLocalStorage.getItem(EXPANDED_FOLDERS_KEY);
+    const parsed = stored ? JSON.parse(stored) : [];
+    return new Set(
+      Array.isArray(parsed) ? parsed.filter((key): key is string => typeof key === "string") : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
 
 function readCollapsedAccountIds(): Set<string> {
   try {
@@ -72,6 +88,7 @@ export default function SidebarGrouped() {
   const setActiveAccountId = useMailStore((s) => s.setActiveAccountId);
   const setActiveFolderId = useMailStore((s) => s.setActiveFolderId);
   const [collapsedAccountIds, setCollapsedAccountIds] = useState<Set<string>>(readCollapsedAccountIds);
+  const [expandedFolderKeys, setExpandedFolderKeys] = useState<Set<string>>(readExpandedFolderKeys);
 
   const showUnread = useUIStore((s) => s.showFolderUnreadCount);
   const { data: accounts = EMPTY_ACCOUNTS } = useAccountsQuery();
@@ -88,6 +105,10 @@ export default function SidebarGrouped() {
     archive: t("sidebar.archive"),
     trash: t("sidebar.trash"),
   };
+
+  const folderLabel = (folder: FolderType) => folder.remote_id === "__local_outbox__"
+    ? t("sidebar.outbox", "Outbox")
+    : folder.role ? ROLE_LABELS[folder.role] : folder.name;
 
   const foldersByAccount = useMemo(() => {
     const byAccount = new Map<string, FolderType[]>();
@@ -130,6 +151,20 @@ export default function SidebarGrouped() {
       if (next.has(accountId)) next.delete(accountId);
       else next.add(accountId);
       profileLocalStorage.setItem(COLLAPSED_ACCOUNTS_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }
+
+  function toggleFolderExpanded(stateKey: string) {
+    setExpandedFolderKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(stateKey)) next.delete(stateKey);
+      else next.add(stateKey);
+      try {
+        profileLocalStorage.setItem(EXPANDED_FOLDERS_KEY, JSON.stringify([...next]));
+      } catch {
+        // storage unavailable: keep the in-memory state
+      }
       return next;
     });
   }
@@ -277,22 +312,99 @@ export default function SidebarGrouped() {
                     </button>
                   )}
                   {!groupCollapsed && (entries.length > 0
-                    ? entries.map((folder) => {
-                        const label = folder.remote_id === "__local_outbox__" ? t("sidebar.outbox", "Outbox")
-                          : folder.role ? ROLE_LABELS[folder.role] : folder.name;
-                        return (
-                          <SidebarButton
-                            key={folder.id}
-                            icon={folder.role ? ROLE_ICONS[folder.role] : <Folder size={16} />}
-                            label={sidebarCollapsed ? `${accountName} · ${label}` : label}
-                            badge={showUnread ? unreadCountForFolder(folder.id, accountFolders, unreadCounts) : undefined}
-                            isActive={activeView === "inbox" && activeAccountId === account.id && activeFolderId === folder.id}
-                            collapsed={sidebarCollapsed}
-                            style={childButtonBase}
-                            onClick={() => handleFolderSelect(account.id, folder.id)}
-                          />
-                        );
-                      })
+                    ? sidebarCollapsed
+                      ? entries.map((folder) => {
+                          const label = folderLabel(folder);
+                          return (
+                            <SidebarButton
+                              key={folder.id}
+                              icon={folder.role ? ROLE_ICONS[folder.role] : <Folder size={16} />}
+                              label={`${accountName} · ${label}`}
+                              badge={showUnread ? unreadCountForFolder(folder.id, accountFolders, unreadCounts) : undefined}
+                              isActive={activeView === "inbox" && activeAccountId === account.id && activeFolderId === folder.id}
+                              collapsed
+                              style={childButtonBase}
+                              onClick={() => handleFolderSelect(account.id, folder.id)}
+                            />
+                          );
+                        })
+                      : (() => {
+                          const tree = buildFolderTree(entries);
+                          const openAncestors = new Set(
+                            activeAccountId === account.id ? ancestorKeys(tree, activeFolderId) : [],
+                          );
+                          const unreadFor = (f: FolderType) => unreadCountForFolder(f.id, accountFolders, unreadCounts);
+                          const renderNode = (node: FolderTreeNode, depth: number): React.ReactNode => {
+                            const stateKey = `${account.id}:${node.key}`;
+                            const hasChildren = node.children.length > 0;
+                            const expanded = hasChildren && (expandedFolderKeys.has(stateKey) || openAncestors.has(node.key));
+                            const folder = node.folder;
+                            const label = folder && (folder.role || folder.remote_id === "__local_outbox__")
+                              ? folderLabel(folder)
+                              : node.label;
+                            const badge = !showUnread
+                              ? undefined
+                              : hasChildren && !expanded
+                                ? totalForNode(node, unreadFor)
+                                : folder ? unreadFor(folder) : undefined;
+                            const indent = TREE_BASE_PADDING_PX + depth * TREE_INDENT_PX;
+                            return (
+                              <div key={node.key} role="treeitem" aria-expanded={hasChildren ? expanded : undefined}>
+                                <div style={{ position: "relative" }}>
+                                  {hasChildren && (
+                                    <button
+                                      type="button"
+                                      aria-label={expanded
+                                        ? t("sidebar.collapseFolder", { name: label, defaultValue: "Collapse {{name}}" })
+                                        : t("sidebar.expandFolder", { name: label, defaultValue: "Expand {{name}}" })}
+                                      onClick={(e) => { e.stopPropagation(); toggleFolderExpanded(stateKey); }}
+                                      style={{
+                                        position: "absolute",
+                                        left: `${indent - 17}px`,
+                                        top: "50%",
+                                        transform: "translateY(-50%)",
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                        width: "16px",
+                                        height: "16px",
+                                        padding: 0,
+                                        border: "none",
+                                        borderRadius: "3px",
+                                        background: "transparent",
+                                        color: "var(--color-text-secondary)",
+                                        cursor: "pointer",
+                                        zIndex: 1,
+                                      }}
+                                    >
+                                      {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                    </button>
+                                  )}
+                                  <SidebarButton
+                                    icon={folder?.role ? ROLE_ICONS[folder.role] : <Folder size={16} />}
+                                    label={label}
+                                    tooltip={folder && !folder.role && folder.name !== label ? folder.name : label}
+                                    badge={badge}
+                                    isActive={!!folder && activeView === "inbox" && activeAccountId === account.id && activeFolderId === folder.id}
+                                    collapsed={false}
+                                    style={{ ...childButtonBase, paddingLeft: `${indent}px` }}
+                                    onClick={() => folder ? handleFolderSelect(account.id, folder.id) : toggleFolderExpanded(stateKey)}
+                                  />
+                                </div>
+                                {expanded && (
+                                  <div role="group" style={{ display: "flex", flexDirection: "column", gap: "1px", marginTop: "1px" }}>
+                                    {node.children.map((child) => renderNode(child, depth + 1))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          };
+                          return (
+                            <div role="tree" aria-label={accountName} style={{ display: "flex", flexDirection: "column", gap: "1px" }}>
+                              {tree.map((node) => renderNode(node, 0))}
+                            </div>
+                          );
+                        })()
                     : !sidebarCollapsed && foldersFetched && (
                         <div style={{ padding: "4px 8px", fontSize: "12px", color: "var(--color-text-secondary)" }}>
                           {t("sidebar.noFolders", "No folders yet")}
@@ -363,10 +475,12 @@ export default function SidebarGrouped() {
 
 // Reusable sidebar button to avoid repetitive hover logic
 function SidebarButton({
-  icon, label, badge, isActive, collapsed, style, disabled, onClick,
+  icon, label, tooltip, badge, isActive, collapsed, style, disabled, onClick,
 }: {
   icon: React.ReactNode;
   label: string;
+  /** Hover text when expanded, e.g. the full folder path */
+  tooltip?: string;
   badge?: number;
   isActive: boolean;
   collapsed: boolean;
@@ -380,7 +494,7 @@ function SidebarButton({
       onClick={onClick}
       aria-label={collapsed ? label : undefined}
       aria-current={isActive ? "page" : undefined}
-      title={collapsed ? label : undefined}
+      title={collapsed ? label : tooltip}
       disabled={disabled}
       style={{
         ...style,
