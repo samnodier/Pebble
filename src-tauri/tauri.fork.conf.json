@@ -1,4 +1,11 @@
 {
   "productName": "Pebble Mail",
-  "mainBinaryName": "pebble-mail"
+  "mainBinaryName": "pebble-mail",
+  "bundle": {
+    "linux": {
+      "rpm": {
+        "release": "2"
+      }
+    }
+  }
 }
