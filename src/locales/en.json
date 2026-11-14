@@ -444,7 +444,12 @@
       "goSent": "Go to Sent",
       "goDrafts": "Go to Drafts",
       "goArchive": "Go to Archive",
-      "goTrash": "Go to Trash"
+      "goTrash": "Go to Trash",
+      "page": "Move down / up 10 messages",
+      "select": "Select message (d d, Delete and e then act on the selection)",
+      "undo": "Undo the last delete or archive",
+      "help": "Show keyboard shortcuts",
+      "nothingToUndo": "Nothing to undo"
     },
     "toggleView": "Toggle Inbox/Kanban view",
     "moveToKanban": "Move to kanban",

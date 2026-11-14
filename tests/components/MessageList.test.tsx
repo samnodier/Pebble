@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Account, Folder, MessageSummary } from "../../src/lib/api";
 import { useMailStore } from "../../src/stores/mail.store";
@@ -148,6 +148,30 @@ describe("MessageList", () => {
     })));
     expect(mocks.batchDelete).not.toHaveBeenCalled();
   });
+  it("runs keyboard bulk delete through the same confirmation", async () => {
+    useMailStore.setState({ batchMode: true, selectedMessageIds: new Set(["m-1"]) });
+    mocks.confirm.mockResolvedValue(true);
+    mocks.batchDelete.mockResolvedValue(1);
+    render(<MessageList messages={[makeMessage("m-1")]} selectedMessageId={null} onSelectMessage={vi.fn()} loading={false} />);
+    act(() => {
+      document.dispatchEvent(new CustomEvent("pebble:batch-action", { detail: "delete" }));
+    });
+    await waitFor(() => expect(mocks.batchDelete).toHaveBeenCalledWith(["m-1"]));
+    expect(mocks.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs keyboard bulk archive and ignores unknown actions", async () => {
+    useMailStore.setState({ batchMode: true, selectedMessageIds: new Set(["m-1"]) });
+    mocks.batchArchive.mockResolvedValue(1);
+    render(<MessageList messages={[makeMessage("m-1")]} selectedMessageId={null} onSelectMessage={vi.fn()} loading={false} />);
+    act(() => {
+      document.dispatchEvent(new CustomEvent("pebble:batch-action", { detail: "explode" }));
+      document.dispatchEvent(new CustomEvent("pebble:batch-action", { detail: "archive" }));
+    });
+    await waitFor(() => expect(mocks.batchArchive).toHaveBeenCalledWith(["m-1"]));
+    expect(mocks.batchDelete).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.accounts = [

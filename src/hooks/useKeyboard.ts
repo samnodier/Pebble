@@ -15,7 +15,7 @@ import {
   snapshotMessagesCache,
 } from "@/hooks/queries";
 import { allAccountsFolderId, roleForSelection, type FolderRole } from "@/lib/folderAggregation";
-import { VIM_BINDINGS, VIM_PREFIXES, VIM_SEQUENCE_TIMEOUT_MS } from "@/lib/vimKeys";
+import { VIM_BINDINGS, VIM_PAGE_STEP, VIM_PREFIXES, VIM_SEQUENCE_TIMEOUT_MS } from "@/lib/vimKeys";
 import i18n from "@/lib/i18n";
 
 function eventToKeyString(e: KeyboardEvent): string {
@@ -59,6 +59,67 @@ function invalidateAfterMove() {
   queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
 }
 
+/** The most recent keyboard delete/archive, undone by "u" or the toast button */
+let pendingUndo: (() => void) | null = null;
+
+/** Test hook: forget any undo left over from a previous test */
+export function resetKeyboardUndo() {
+  pendingUndo = null;
+}
+
+function registerUndo(undo: () => Promise<unknown>, messageId: string, failureMessage: string): () => void {
+  const run = () => {
+    if (pendingUndo === run) pendingUndo = null;
+    undo()
+      .then(() => {
+        invalidateAfterMove();
+        useMailStore.getState().setSelectedMessage(messageId);
+      })
+      .catch(() => {
+        useToastStore.getState().addToast({ message: failureMessage, type: "error" });
+      });
+  };
+  pendingUndo = run;
+  return run;
+}
+
+/**
+ * In bulk-selection mode, hand the action to the message list's batch handler,
+ * which owns the confirmation dialog. Returns false when nothing is selected.
+ */
+function dispatchBatchAction(action: "delete" | "archive"): boolean {
+  const { batchMode, selectedMessageIds } = useMailStore.getState();
+  if (!batchMode || selectedMessageIds.size === 0) return false;
+  document.dispatchEvent(new CustomEvent("pebble:batch-action", { detail: action }));
+  return true;
+}
+
+/** Move the selection by `delta` messages (or threads), clamped to the list */
+function moveSelectionBy(delta: number) {
+  const state = useMailStore.getState();
+  if (state.threadView) {
+    const threads = getCachedThreads();
+    if (threads.length === 0) return;
+    const idx = threads.findIndex((t) => t.thread_id === state.selectedThreadId);
+    const next = Math.min(Math.max((idx < 0 ? 0 : idx + delta), 0), threads.length - 1);
+    state.setSelectedThreadId(threads[next].thread_id);
+  } else {
+    const messages = getCachedMessages();
+    if (messages.length === 0) return;
+    const idx = messages.findIndex((m) => m.id === state.selectedMessageId);
+    const next = Math.min(Math.max((idx < 0 ? 0 : idx + delta), 0), messages.length - 1);
+    state.setSelectedMessage(messages[next].id);
+  }
+}
+
+/** x: add or remove the current message from the bulk selection */
+function toggleCurrentInSelection() {
+  const state = useMailStore.getState();
+  if (state.threadView || !state.selectedMessageId) return;
+  if (!state.batchMode) state.toggleBatchMode();
+  useMailStore.getState().toggleMessageSelection(state.selectedMessageId);
+}
+
 /**
  * Move the selected message to Trash from the keyboard.
  *
@@ -68,6 +129,7 @@ function invalidateAfterMove() {
  * refused here and left to the toolbar's confirmed Delete button.
  */
 function deleteSelectedMessage() {
+  if (dispatchBatchAction("delete")) return;
   const mail = useMailStore.getState();
   const selectedId = mail.selectedMessageId;
   if (!selectedId) return;
@@ -103,19 +165,11 @@ function deleteSelectedMessage() {
         type: "success",
         action: {
           label: i18n.t("common.undo", "Undo"),
-          onClick: () => {
-            restoreMessage(selectedId)
-              .then(() => {
-                invalidateAfterMove();
-                useMailStore.getState().setSelectedMessage(selectedId);
-              })
-              .catch(() => {
-                useToastStore.getState().addToast({
-                  message: i18n.t("messageActions.restoreFailed", "Failed to restore message"),
-                  type: "error",
-                });
-              });
-          },
+          onClick: registerUndo(
+            () => restoreMessage(selectedId),
+            selectedId,
+            i18n.t("messageActions.restoreFailed", "Failed to restore message"),
+          ),
         },
       });
     })
@@ -183,6 +237,8 @@ function runAction(actionId: string) {
         useComposeStore.getState().closeCompose();
       } else if (useUIStore.getState().activeView === "search") {
         useUIStore.getState().setActiveView("inbox");
+      } else if (useMailStore.getState().batchMode) {
+        useMailStore.getState().toggleBatchMode();
       }
       break;
     case "toggle-view-inbox":
@@ -219,6 +275,7 @@ function runAction(actionId: string) {
       break;
     }
     case "archive-message": {
+      if (dispatchBatchAction("archive")) break;
       const { selectedMessageId } = useMailStore.getState();
       if (selectedMessageId) {
         // Optimistic removal from React Query cache
@@ -233,7 +290,19 @@ function runAction(actionId: string) {
             queryClient.invalidateQueries({ queryKey: ["threads"] });
             queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
             const msg = result === "unarchived" ? i18n.t("messageActions.unarchiveSuccess", "Message moved to inbox") : i18n.t("messageActions.archiveSuccess", "Message archived");
-            useToastStore.getState().addToast({ message: msg, type: "success" });
+            // Archiving an archived message moves it back, so the same call undoes it
+            const undo = result === "archived"
+              ? registerUndo(
+                () => archiveMessage(selectedMessageId),
+                selectedMessageId,
+                i18n.t("messageActions.unarchiveFailed", "Failed to unarchive"),
+              )
+              : undefined;
+            useToastStore.getState().addToast({
+              message: msg,
+              type: "success",
+              ...(undo ? { action: { label: i18n.t("common.undo", "Undo"), onClick: undo } } : {}),
+            });
           })
           .catch(() => {
             queryClient.invalidateQueries({ queryKey: ["messages"] });
@@ -357,6 +426,29 @@ function runAction(actionId: string) {
       break;
     case "close-message":
       closeSelectedMessage();
+      break;
+    case "page-down":
+      moveSelectionBy(VIM_PAGE_STEP);
+      break;
+    case "page-up":
+      moveSelectionBy(-VIM_PAGE_STEP);
+      break;
+    case "toggle-select":
+      toggleCurrentInSelection();
+      break;
+    case "undo":
+      if (pendingUndo) {
+        pendingUndo();
+      } else {
+        useToastStore.getState().addToast({
+          message: i18n.t("shortcuts.vim.nothingToUndo", "Nothing to undo"),
+          type: "info",
+        });
+      }
+      break;
+    case "show-shortcuts":
+      useUIStore.getState().setSettingsTab("shortcuts");
+      useUIStore.getState().setActiveView("settings");
       break;
     case "go-inbox":
       goToFolderRole("inbox");

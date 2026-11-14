@@ -92,6 +92,18 @@ export default function MessageList({
     }
   }, [selectedMessageId, messages, virtualizer]);
 
+  // Keyboard shortcuts (dd / Delete / e) act on the bulk selection through
+  // the same handler, and confirmation, as the batch toolbar buttons.
+  const batchActionRef = useRef<((action: "archive" | "delete") => void) | null>(null);
+  useEffect(() => {
+    function onBatchAction(e: Event) {
+      const action = (e as CustomEvent<unknown>).detail;
+      if (action === "archive" || action === "delete") batchActionRef.current?.(action);
+    }
+    document.addEventListener("pebble:batch-action", onBatchAction);
+    return () => document.removeEventListener("pebble:batch-action", onBatchAction);
+  }, []);
+
   if (loading) {
     return <MessageListSkeleton />;
   }
@@ -169,6 +181,8 @@ export default function MessageList({
       setBatchLoading(false);
     }
   }
+
+  batchActionRef.current = (action) => { void handleBatchAction(action); };
 
   const allSelected = messages.length > 0 && selectedMessageIds.size === messages.length;
 

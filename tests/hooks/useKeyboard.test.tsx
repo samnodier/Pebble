@@ -45,11 +45,13 @@ vi.mock("../../src/lib/i18n", () => ({
   },
 }));
 
-import { useKeyboard } from "../../src/hooks/useKeyboard";
+import { resetKeyboardUndo, useKeyboard } from "../../src/hooks/useKeyboard";
+import { useUIStore } from "../../src/stores/ui.store";
 
 describe("useKeyboard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetKeyboardUndo();
     mocks.archiveMessage.mockResolvedValue("archived");
     useShortcutStore.setState({
       bindings: { ...DEFAULT_BINDINGS, "archive-message": "E" },
@@ -305,6 +307,116 @@ describe("useKeyboard", () => {
       });
       input.remove();
       expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("vim paging, selection, undo and help", () => {
+    const many = Array.from({ length: 25 }, (_, i) => ({ id: `m${i}`, remote_id: `r${i}`, is_draft: false }));
+
+    function press(key: string, init: KeyboardEventInit = {}) {
+      act(() => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...init }));
+      });
+    }
+
+    beforeEach(() => {
+      mocks.deleteMessage.mockResolvedValue(undefined);
+      mocks.restoreMessage.mockResolvedValue(undefined);
+      mocks.readFirstCachedMessages.mockReturnValue(many);
+      mocks.queryClient.getQueriesData.mockImplementation(
+        ({ queryKey }: { queryKey: string[] }) =>
+          queryKey[0] === "folders" ? [[["folders", "acc-1"], [{ id: "inbox-1", account_id: "acc-1", role: "inbox" }]]] : [],
+      );
+      useShortcutStore.setState({ vimMode: true });
+      useMailStore.setState({
+        activeAccountId: "acc-1",
+        activeFolderId: "inbox-1",
+        selectedMessageId: "m5",
+        batchMode: false,
+        selectedMessageIds: new Set(),
+      });
+      useToastStore.setState({ toasts: [] });
+    });
+
+    it("Ctrl+d and Ctrl+u move ten messages, stopping at the ends", () => {
+      renderHook(() => useKeyboard());
+      press("d", { ctrlKey: true });
+      expect(useMailStore.getState().selectedMessageId).toBe("m15");
+      press("d", { ctrlKey: true });
+      expect(useMailStore.getState().selectedMessageId).toBe("m24");
+      press("u", { ctrlKey: true });
+      expect(useMailStore.getState().selectedMessageId).toBe("m14");
+      press("u", { ctrlKey: true });
+      press("u", { ctrlKey: true });
+      expect(useMailStore.getState().selectedMessageId).toBe("m0");
+    });
+
+    it("x toggles the current message in a bulk selection", () => {
+      renderHook(() => useKeyboard());
+      press("x");
+      expect(useMailStore.getState().batchMode).toBe(true);
+      expect([...useMailStore.getState().selectedMessageIds]).toEqual(["m5"]);
+      press("j");
+      press("x");
+      expect([...useMailStore.getState().selectedMessageIds].sort()).toEqual(["m5", "m6"]);
+      press("x");
+      expect([...useMailStore.getState().selectedMessageIds]).toEqual(["m5"]);
+    });
+
+    it("dd, Delete and e act on the bulk selection through the list", () => {
+      const seen: unknown[] = [];
+      const listener = (e: Event) => seen.push((e as CustomEvent).detail);
+      document.addEventListener("pebble:batch-action", listener);
+      try {
+        renderHook(() => useKeyboard());
+        press("x");
+        press("d");
+        press("d");
+        press("Delete");
+        press("e");
+        expect(seen).toEqual(["delete", "delete", "archive"]);
+        expect(mocks.deleteMessage).not.toHaveBeenCalled();
+        expect(mocks.archiveMessage).not.toHaveBeenCalled();
+      } finally {
+        document.removeEventListener("pebble:batch-action", listener);
+      }
+    });
+
+    it("Escape leaves bulk selection", () => {
+      renderHook(() => useKeyboard());
+      press("x");
+      press("Escape");
+      expect(useMailStore.getState().batchMode).toBe(false);
+      expect(useMailStore.getState().selectedMessageIds.size).toBe(0);
+    });
+
+    it("u undoes the last delete once", async () => {
+      renderHook(() => useKeyboard());
+      press("Delete");
+      await waitFor(() => expect(useToastStore.getState().toasts.some((t) => t.action)).toBe(true));
+      press("u");
+      await waitFor(() => expect(mocks.restoreMessage).toHaveBeenCalledWith("m5"));
+      await waitFor(() => expect(useMailStore.getState().selectedMessageId).toBe("m5"));
+
+      press("u");
+      expect(mocks.restoreMessage).toHaveBeenCalledTimes(1);
+      expect(useToastStore.getState().toasts.at(-1)?.message).toBe("Nothing to undo");
+    });
+
+    it("u undoes an archive by archiving the message again", async () => {
+      renderHook(() => useKeyboard());
+      press("e");
+      await waitFor(() => expect(useToastStore.getState().toasts.some((t) => t.action)).toBe(true));
+      press("u");
+      await waitFor(() => expect(mocks.archiveMessage).toHaveBeenCalledTimes(2));
+      expect(mocks.archiveMessage).toHaveBeenLastCalledWith("m5");
+    });
+
+    it("? opens the shortcuts settings", () => {
+      renderHook(() => useKeyboard());
+      press("?", { shiftKey: true });
+      expect(useUIStore.getState().activeView).toBe("settings");
+      expect(useUIStore.getState().settingsTab).toBe("shortcuts");
     });
   });
 });
