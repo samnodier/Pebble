@@ -5,10 +5,16 @@ import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
 import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
-import { updateMessageFlags, archiveMessage, getMessage } from "@/lib/api";
+import { updateMessageFlags, archiveMessage, deleteMessage, restoreMessage, getMessage } from "@/lib/api";
 import { queryClient } from "@/lib/query-client";
-import type { MessageSummary, ThreadSummary } from "@/lib/api";
-import { patchMessagesCache, readFirstCachedMessages } from "@/hooks/queries";
+import type { Folder, MessageSummary, ThreadSummary } from "@/lib/api";
+import {
+  patchMessagesCache,
+  readFirstCachedMessages,
+  restoreMessagesCache,
+  snapshotMessagesCache,
+} from "@/hooks/queries";
+import { roleForSelection } from "@/lib/folderAggregation";
 import i18n from "@/lib/i18n";
 
 function eventToKeyString(e: KeyboardEvent): string {
@@ -37,6 +43,89 @@ function getCachedThreads(): ThreadSummary[] {
     if (data && data.length > 0) return data;
   }
   return [];
+}
+
+/** All folders currently held in the React Query cache, across accounts */
+function getCachedFolders(): Folder[] {
+  return queryClient
+    .getQueriesData<Folder[]>({ queryKey: ["folders"] })
+    .flatMap(([, data]) => (Array.isArray(data) ? data : []));
+}
+
+function invalidateAfterMove() {
+  queryClient.invalidateQueries({ queryKey: ["messages"] });
+  queryClient.invalidateQueries({ queryKey: ["threads"] });
+  queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+}
+
+/**
+ * Move the selected message to Trash from the keyboard.
+ *
+ * Unlike the toolbar button this skips the confirm dialog, because it can only
+ * ever move to Trash, and offers Undo instead. Anything that would be a
+ * permanent delete (a message already in Trash, or a local-only draft) is
+ * refused here and left to the toolbar's confirmed Delete button.
+ */
+function deleteSelectedMessage() {
+  const mail = useMailStore.getState();
+  const selectedId = mail.selectedMessageId;
+  if (!selectedId) return;
+
+  const toast = useToastStore.getState();
+  const folderRole = roleForSelection(mail.activeFolderId, getCachedFolders());
+  const messages = getCachedMessages();
+  const idx = messages.findIndex((m) => m.id === selectedId);
+  const msg = idx >= 0 ? messages[idx] : undefined;
+
+  if (folderRole === "trash" || (msg?.is_draft && msg.remote_id === "")) {
+    toast.addToast({
+      message: i18n.t(
+        "messageActions.permanentDeleteNeedsButton",
+        "Use the Delete button to permanently delete this message",
+      ),
+      type: "info",
+    });
+    return;
+  }
+
+  // Keep the reader moving: select the next message, or the previous one at the end
+  const neighbour = idx >= 0 ? (messages[idx + 1] ?? messages[idx - 1]) : undefined;
+  const previousLists = snapshotMessagesCache(queryClient);
+  patchMessagesCache(queryClient, (page) => page.filter((m) => m.id !== selectedId));
+  mail.setSelectedMessage(neighbour?.id ?? null);
+
+  deleteMessage(selectedId)
+    .then(() => {
+      invalidateAfterMove();
+      toast.addToast({
+        message: i18n.t("messageActions.deleteSuccess", "Message deleted"),
+        type: "success",
+        action: {
+          label: i18n.t("common.undo", "Undo"),
+          onClick: () => {
+            restoreMessage(selectedId)
+              .then(() => {
+                invalidateAfterMove();
+                useMailStore.getState().setSelectedMessage(selectedId);
+              })
+              .catch(() => {
+                useToastStore.getState().addToast({
+                  message: i18n.t("messageActions.restoreFailed", "Failed to restore message"),
+                  type: "error",
+                });
+              });
+          },
+        },
+      });
+    })
+    .catch(() => {
+      restoreMessagesCache(queryClient, previousLists);
+      useMailStore.getState().setSelectedMessage(selectedId);
+      toast.addToast({
+        message: i18n.t("messageActions.deleteFailed", "Failed to delete message"),
+        type: "error",
+      });
+    });
 }
 
 export function useKeyboard() {
@@ -159,6 +248,9 @@ export function useKeyboard() {
           }
           break;
         }
+        case "delete-message":
+          deleteSelectedMessage();
+          break;
         case "next-message": {
           const state = useMailStore.getState();
           if (state.threadView) {
