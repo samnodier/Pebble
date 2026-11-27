@@ -60,6 +60,15 @@ function mailNav() {
   return screen.getByRole("navigation", { name: "Mail folders" });
 }
 
+/** The folder button whose visible name is exactly `label` */
+function folderButton(label: string): HTMLElement {
+  const match = within(mailNav())
+    .getAllByRole("button")
+    .find((b) => b.querySelector(".sidebar-btn__label")?.textContent === label);
+  if (!match) throw new Error(`No folder button labelled ${label}`);
+  return match;
+}
+
 function visibleLabels() {
   return within(mailNav())
     .getAllByRole("button")
@@ -109,7 +118,7 @@ describe("Sidebar folder tree", () => {
 
   it("shows the total unread of a collapsed folder and its sub-folders", () => {
     render(<Sidebar />);
-    const clients = within(mailNav()).getByTitle("Clients");
+    const clients = folderButton("Clients");
     expect(clients.textContent).toBe("Clients6");
   });
 
@@ -117,7 +126,7 @@ describe("Sidebar folder tree", () => {
     const { unmount } = render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: "Expand Clients" }));
     expect(visibleLabels()).toEqual(expect.arrayContaining(["Amy & Todd2", "Mara Ream3"]));
-    expect(within(mailNav()).getByTitle("Clients").textContent).toBe("Clients1");
+    expect(folderButton("Clients").textContent).toBe("Clients1");
 
     unmount();
     render(<Sidebar />);
@@ -126,7 +135,7 @@ describe("Sidebar folder tree", () => {
 
   it("opens a parent folder when its name is clicked, without toggling it", () => {
     render(<Sidebar />);
-    fireEvent.click(within(mailNav()).getByTitle("Clients"));
+    fireEvent.click(folderButton("Clients"));
     expect(useMailStore.getState().activeFolderId).toBe("clients");
     expect(screen.getByRole("button", { name: "Expand Clients" })).toBeTruthy();
   });
@@ -147,7 +156,7 @@ describe("Sidebar folder tree", () => {
   it("toggles the virtual Gmail group by clicking its name", () => {
     render(<Sidebar />);
     expect(visibleLabels()).not.toContain("All Mail");
-    fireEvent.click(within(mailNav()).getByTitle("Gmail"));
+    fireEvent.click(folderButton("Gmail"));
     expect(visibleLabels()).toContain("All Mail");
     expect(useMailStore.getState().activeFolderId).toBe("inbox");
   });
