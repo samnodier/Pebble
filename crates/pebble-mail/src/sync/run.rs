@@ -161,6 +161,14 @@ impl SyncWorker {
             reconcile_interval,
         );
         reconcile_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut inbox_flag_ticker = tokio::time::interval_at(
+            tokio::time::Instant::from_std(first_reconcile_deadline(
+                Instant::now(),
+                INBOX_FLAG_CHECK_INTERVAL,
+            )),
+            INBOX_FLAG_CHECK_INTERVAL,
+        );
+        inbox_flag_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let supports_idle = self.provider.inner().supports_idle().await;
         if supports_idle {
@@ -398,6 +406,8 @@ impl SyncWorker {
                                 continue;
                             }
                             let poll_result = if trigger == SyncTrigger::Manual {
+                                // A manual refresh also picks up read state changed elsewhere
+                                reconcile_ticker.reset_immediately();
                                 self.poll_all_new_messages("manual").await
                             } else {
                                 self.poll_new_messages().await
@@ -416,6 +426,19 @@ impl SyncWorker {
                         }
                         None => {
                             trigger_rx = None;
+                        }
+                    }
+                }
+                _ = inbox_flag_ticker.tick(), if supports_condstore => {
+                    if backoff.is_circuit_open() {
+                        continue;
+                    }
+                    let inbox = self.base.store.list_folders(&self.base.account_id).ok().and_then(|folders| {
+                        folders.into_iter().find(|f| f.role == Some(pebble_core::FolderRole::Inbox))
+                    });
+                    if let Some(inbox) = inbox {
+                        if let Err(e) = self.reconcile_folder(&inbox).await {
+                            debug!("Inbox flag check failed for account {}: {}", self.base.account_id, e);
                         }
                     }
                 }

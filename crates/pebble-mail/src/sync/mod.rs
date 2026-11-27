@@ -171,6 +171,10 @@ fn first_reconcile_deadline(now: Instant, interval: Duration) -> Instant {
     now + interval
 }
 
+/// How often Inbox read/star state is checked between full reconciles. Only
+/// with CONDSTORE, where an unchanged mailbox costs one STATUS round trip.
+const INBOX_FLAG_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 fn should_notify_imap_startup_fetch(since_uid: Option<u32>) -> bool {
     since_uid.is_some()
 }

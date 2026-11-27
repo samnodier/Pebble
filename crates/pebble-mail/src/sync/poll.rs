@@ -272,10 +272,15 @@ impl SyncWorker {
                     flag_changes.len(),
                     folder.name
                 );
+                let changed_ids: Vec<String> =
+                    flag_changes.iter().map(|(id, _, _)| id.clone()).collect();
                 blocking_store(&self.base.store, move |store| {
                     store.bulk_update_flags(&flag_changes)
                 })
                 .await?;
+                // Read/star changes made elsewhere (webmail, phone) show up in open lists
+                self.base
+                    .emit_list_refresh(vec![folder.id.clone()], changed_ids);
             }
             // Advance MODSEQ only when every server change was applied, so
             // skipped messages are looked at again on the next pass.
